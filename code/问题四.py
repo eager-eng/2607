@@ -137,6 +137,24 @@ def material_residual(alk_power, pem_power, ammonia_power):
     return 14.0 * alk_power + 16.0 * pem_power - 400.0 * ammonia_power
 
 
+def hydrogen_capacity_utilization(alk_power, pem_power):
+    hydrogen_output = 14.0 * np.asarray(alk_power, dtype=float) + 16.0 * np.asarray(pem_power, dtype=float)
+    rated_output = HOURS * (14.0 * ALK_MAX_MW + 16.0 * PEM_MAX_MW)
+    return 100.0 * float(np.sum(hydrogen_output)) / rated_output
+
+
+def conventional_load_supply_rate(shed_energy, conventional_energy):
+    if conventional_energy <= 0.0:
+        return 100.0
+    return 100.0 * (1.0 - float(shed_energy) / float(conventional_energy))
+
+
+def local_electricity_self_sufficiency(buy_energy, terminal_consumption):
+    if terminal_consumption <= 0.0:
+        return 100.0
+    return 100.0 * (1.0 - float(buy_energy) / float(terminal_consumption))
+
+
 def battery_daily_fixed_cost(capacity_mwh, unit_cost_yuan_per_kwh=1000.0, lifetime_years=15.0):
     if capacity_mwh < 0.0:
         raise ValueError("Battery capacity cannot be negative")
@@ -687,6 +705,12 @@ def summarize_dispatch(data, scenario, dispatch, battery_capacity_mwh=0.0, mode=
     conventional_energy = float(np.sum(conventional))
     curtail_energy = float(np.sum(curtail))
     shed_energy = float(np.sum(shed))
+    terminal_consumption = float(
+        conventional_energy
+        - shed_energy
+        + np.sum(dispatch["alk"] + dispatch["pem"] + dispatch["ammonia"])
+    )
+    buy_energy = float(np.sum(buy))
     summary = {
         "运行模式": mode,
         "场景": scenario["场景"],
@@ -696,17 +720,20 @@ def summarize_dispatch(data, scenario, dispatch, battery_capacity_mwh=0.0, mode=
         "新能源发电量(MWh)": generation_energy,
         "弃电量(MWh)": curtail_energy,
         "弃电率(%)": 100.0 * curtail_energy / generation_energy if generation_energy > 0 else 0.0,
+        "常规负荷需求量(MWh)": conventional_energy,
         "常规负荷失供量(MWh)": shed_energy,
-        "能源自治率(%)": 100.0 * (1.0 - shed_energy / conventional_energy),
+        "常规负荷供电保障率(%)": conventional_load_supply_rate(shed_energy, conventional_energy),
+        "园区终端用电量(MWh)": terminal_consumption,
+        "本地电力自给率(%)": local_electricity_self_sufficiency(buy_energy, terminal_consumption),
         "新能源利用率(%)": 100.0 * (1.0 - curtail_energy / generation_energy) if generation_energy > 0 else 100.0,
         "碱性电解槽利用率(%)": 100.0 * float(np.sum(dispatch["alk"])) / (HOURS * ALK_MAX_MW),
         "PEM电解槽利用率(%)": 100.0 * float(np.sum(dispatch["pem"])) / (HOURS * PEM_MAX_MW),
-        "制氢装置平均利用率(%)": 100.0 * float(np.sum(dispatch["alk"] + dispatch["pem"])) / (HOURS * (ALK_MAX_MW + PEM_MAX_MW)),
+        "制氢装置平均利用率(%)": hydrogen_capacity_utilization(dispatch["alk"], dispatch["pem"]),
         "合成氨装置利用率(%)": 100.0 * float(np.sum(dispatch["ammonia"])) / (HOURS * AMMONIA_MAX_MW),
         "储能容量(MWh)": battery_capacity_mwh,
         "充电量(MWh)": float(np.sum(charge)),
         "放电量(MWh)": float(np.sum(discharge)),
-        "购电量(MWh)": float(np.sum(buy)),
+        "购电量(MWh)": buy_energy,
         "售电量(MWh)": float(np.sum(sell)),
     }
     summary.update(costs)
@@ -884,13 +911,50 @@ def select_capacity_result(frame, cost_multiplier=1.0):
     return adjusted.loc[admissible["调整后净吨氨成本(¥/t)"].idxmin()]
 
 
+def adaptive_capacity_grid(
+    evaluator,
+    upper,
+    cost_multiplier=1.0,
+    coarse_count=25,
+    refine_count=11,
+    refinement_rounds=5,
+):
+    if upper <= 0.0 or coarse_count < 3 or refine_count < 3 or refinement_rounds < 1:
+        raise ValueError("Capacity search settings are invalid")
+    cache = {}
+
+    def evaluate(capacity):
+        key = round(float(np.clip(capacity, 0.0, upper)), 10)
+        if key not in cache:
+            cache[key] = evaluator(key)
+        return cache[key]
+
+    for capacity in np.linspace(0.0, upper, coarse_count):
+        evaluate(capacity)
+    step = upper / (coarse_count - 1)
+    selected = select_capacity_result(pd.DataFrame(cache.values()), cost_multiplier)
+    for _ in range(refinement_rounds):
+        center = float(selected["储能容量(MWh)"])
+        lower_local = max(0.0, center - step)
+        upper_local = min(upper, center + step)
+        for capacity in np.linspace(lower_local, upper_local, refine_count):
+            evaluate(capacity)
+        step = (upper_local - lower_local) / (refine_count - 1)
+        selected = select_capacity_result(pd.DataFrame(cache.values()), cost_multiplier)
+    frame = pd.DataFrame(cache.values()).sort_values("储能容量(MWh)").reset_index(drop=True)
+    selected = select_capacity_result(frame, cost_multiplier)
+    return frame, selected
+
+
 def search_storage_capacity(
     data,
     scenario,
     c_rate=MAIN_C_RATE,
     daily_self_loss=DAILY_SELF_LOSS,
+    cost_multiplier=1.0,
     coarse_count=25,
     refine_count=11,
+    refinement_rounds=5,
 ):
     baseline, _ = evaluate_storage_capacity(data, scenario, 0.0, c_rate, daily_self_loss)
     upper = max(10.0, 1.25 * baseline["弃电量(MWh)"] / 0.8)
@@ -902,25 +966,14 @@ def search_storage_capacity(
             cache[key] = evaluate_storage_capacity(data, scenario, key, c_rate, daily_self_loss)
         return cache[key]
 
-    for _ in range(4):
-        capacities = np.linspace(0.0, upper, coarse_count)
-        for capacity in capacities:
-            evaluate(capacity)
-        coarse_frame = pd.DataFrame([summary for summary, _ in cache.values()])
-        selected = select_capacity_result(coarse_frame)
-        at_upper = selected["储能容量(MWh)"] >= upper - upper / max(coarse_count - 1, 1)
-        if selected["常规负荷失供量(MWh)"] <= 1e-5 or not at_upper:
-            break
-        upper *= 2.0
-    coarse_step = upper / max(coarse_count - 1, 1)
-    selected = select_capacity_result(pd.DataFrame([summary for summary, _ in cache.values()]))
-    center = float(selected["储能容量(MWh)"])
-    lower_refine = max(0.0, center - coarse_step)
-    upper_refine = center + coarse_step
-    for capacity in np.linspace(lower_refine, upper_refine, refine_count):
-        evaluate(capacity)
-    frame = pd.DataFrame([summary for summary, _ in cache.values()]).sort_values("储能容量(MWh)").reset_index(drop=True)
-    selected = select_capacity_result(frame)
+    frame, selected = adaptive_capacity_grid(
+        lambda capacity: evaluate(capacity)[0],
+        upper,
+        cost_multiplier=cost_multiplier,
+        coarse_count=coarse_count,
+        refine_count=refine_count,
+        refinement_rounds=refinement_rounds,
+    )
     best_capacity = float(selected["储能容量(MWh)"])
     best_summary, best_dispatch = cache[round(best_capacity, 8)]
     frame["是否最优容量"] = np.isclose(frame["储能容量(MWh)"], best_capacity, atol=1e-8)
@@ -932,8 +985,10 @@ def aggregate_annual(summary, label):
     annual_production = SCENARIO_DAYS * float(summary["日氨产量(t/day)"].sum())
     generation = float(summary["新能源发电量(MWh)"].sum())
     curtail = float(summary["弃电量(MWh)"].sum())
-    conventional_energy = 24.0 * float(np.mean(summary["常规负荷失供量(MWh)"].apply(lambda _: 0.0)))
-    del conventional_energy
+    conventional_energy = float(summary["常规负荷需求量(MWh)"].sum())
+    shed = float(summary["常规负荷失供量(MWh)"].sum())
+    terminal_consumption = float(summary["园区终端用电量(MWh)"].sum())
+    buy = float(summary["购电量(MWh)"].sum())
     return pd.DataFrame(
         [
             {
@@ -942,11 +997,12 @@ def aggregate_annual(summary, label):
                 "年综合净成本(¥/year)": annual_cost,
                 "综合净吨氨成本(¥/t)": annual_cost / annual_production if annual_production > 0 else np.nan,
                 "全年弃电量(MWh/year)": SCENARIO_DAYS * curtail,
-                "全年负荷失供量(MWh/year)": SCENARIO_DAYS * float(summary["常规负荷失供量(MWh)"].sum()),
-                "全年购电量(MWh/year)": SCENARIO_DAYS * float(summary["购电量(MWh)"].sum()),
+                "全年负荷失供量(MWh/year)": SCENARIO_DAYS * shed,
+                "全年购电量(MWh/year)": SCENARIO_DAYS * buy,
                 "全年售电量(MWh/year)": SCENARIO_DAYS * float(summary["售电量(MWh)"].sum()),
                 "新能源利用率(%)": 100.0 * (1.0 - curtail / generation) if generation > 0 else 100.0,
-                "平均能源自治率(%)": float(summary["能源自治率(%)"].mean()),
+                "常规负荷供电保障率(%)": conventional_load_supply_rate(shed, conventional_energy),
+                "本地电力自给率(%)": local_electricity_self_sufficiency(buy, terminal_consumption),
                 "制氢装置平均利用率(%)": float(summary["制氢装置平均利用率(%)"].mean()),
                 "合成氨装置平均利用率(%)": float(summary["合成氨装置利用率(%)"].mean()),
             }
@@ -1161,15 +1217,18 @@ def generate_figures(
     axes[2].grid(alpha=0.25)
     save_figure(fig, figure_dir, "问题四最大弃电场景储能前后调度")
 
+    best = capacity_search[capacity_search["是否最优容量"]].iloc[0]
+    local_limit = max(3.0, 4.0 * float(best["储能容量(MWh)"]))
+    local_search = capacity_search[capacity_search["储能容量(MWh)"] <= local_limit].sort_values("储能容量(MWh)")
     fig, ax1 = plt.subplots(figsize=(9, 5.4))
-    ax1.plot(capacity_search["储能容量(MWh)"], capacity_search["净吨氨成本(¥/t)"], color=PALETTE["red"], marker="o", markersize=3, label="净吨氨成本")
+    ax1.plot(local_search["储能容量(MWh)"], local_search["净吨氨成本(¥/t)"], color=PALETTE["red"], marker="o", markersize=3, label="净吨氨成本")
     ax1.set_xlabel("储能容量 / MWh")
     ax1.set_ylabel("净吨氨成本 / ¥/t", color=PALETTE["red"])
     ax2 = ax1.twinx()
-    ax2.plot(capacity_search["储能容量(MWh)"], capacity_search["弃电率(%)"], color=PALETTE["blue"], linewidth=2.0, label="弃电率")
+    ax2.plot(local_search["储能容量(MWh)"], local_search["弃电率(%)"], color=PALETTE["blue"], linewidth=2.0, label="弃电率")
     ax2.set_ylabel("弃电率 / %", color=PALETTE["blue"])
-    best = capacity_search[capacity_search["是否最优容量"]].iloc[0]
     ax1.axvline(best["储能容量(MWh)"], color=PALETTE["orange"], linestyle="--", label="最优容量")
+    ax1.set_xlim(0.0, local_limit)
     ax1.grid(alpha=0.25)
     lines = ax1.get_lines() + ax2.get_lines()
     ax1.legend(lines, [line.get_label() for line in lines], loc="best")
@@ -1239,6 +1298,14 @@ def write_report(
     best_capacity = capacity_search[capacity_search["是否最优容量"]].iloc[0]
     support = float(storage_annual["年综合净成本(¥/year)"] - grid_annual["年综合净成本(¥/year)"])
     support_t = support / float(storage_annual["年氨产量(t/year)"])
+    production_change = float(storage_annual["年氨产量(t/year)"] - no_storage_annual["年氨产量(t/year)"])
+    curtailment_change = float(storage_annual["全年弃电量(MWh/year)"] - no_storage_annual["全年弃电量(MWh/year)"])
+    utilization_change = float(storage_annual["新能源利用率(%)"] - no_storage_annual["新能源利用率(%)"])
+    shedding_change = float(storage_annual["全年负荷失供量(MWh/year)"] - no_storage_annual["全年负荷失供量(MWh/year)"])
+    tonne_cost_change = float(storage_annual["综合净吨氨成本(¥/t)"] - no_storage_annual["综合净吨氨成本(¥/t)"])
+    hydrogen_utilization_change = float(
+        storage_annual["制氢装置平均利用率(%)"] - no_storage_annual["制氢装置平均利用率(%)"]
+    )
     frontier_explanation = (
         "严格72 t/day要求意味着合成氨装置必须24 h满功率运行；控制性约束出现在无光伏的夜间，故本数据下风光容量Pareto边界退化为纯风电单点。"
         if len(frontier) == 1
@@ -1255,6 +1322,8 @@ def write_report(
 {frame_to_markdown(no_storage_annual.to_frame().T)}
 
 24种场景中最大弃电场景为 **{max_curtail_scenario}**。日制氨量范围为 **{no_storage_summary['日氨产量(t/day)'].min():.3f}–{no_storage_summary['日氨产量(t/day)'].max():.3f} t/day**，场景吨氨成本范围为 **{no_storage_summary['净吨氨成本(¥/t)'].min():.2f}–{no_storage_summary['净吨氨成本(¥/t)'].max():.2f} ¥/t**。
+
+离网模式没有外部购电，因此本地电力自给率为100%；该指标只表示实际用电全部来自园区风光。能源充足程度另由常规负荷供电保障率和氢氨装置产能利用率衡量，避免把“没有购电”误写成“能够满产”。
 
 ![无储能场景运行热力图](../figures/问题四计算结果/问题四无储能场景运行热力图.png)
 
@@ -1275,6 +1344,8 @@ def write_report(
 
 {frame_to_markdown(storage_annual.to_frame().T)}
 
+与无储能方案相比，配置储能后年制氨量变化 **{production_change:+.3f} t/year**，全年弃电量变化 **{curtailment_change:+.3f} MWh/year**，新能源利用率变化 **{utilization_change:+.3f} 个百分点**，常规负荷失供量变化 **{shedding_change:+.3f} MWh/year**，综合净吨氨成本变化 **{tonne_cost_change:+.3f} ¥/t**，制氢装置平均利用率变化 **{hydrogen_utilization_change:+.3f} 个百分点**。其中负号表示弃电、失供或成本下降。
+
 ![最大弃电场景储能前后调度](../figures/问题四计算结果/问题四最大弃电场景储能前后调度.png)
 
 ![储能容量经济性曲线](../figures/问题四计算结果/问题四储能容量经济性曲线.png)
@@ -1283,9 +1354,13 @@ def write_report(
 
 {frame_to_markdown(sensitivity)}
 
+储能时长结果呈现“倍率越低、达到同一启停收益台阶所需能量容量越大”的规律。日自损耗0.1%–0.3%/day以及投资成本±20%均未改变最优启停组合，因此最优容量稳定在约0.63 MWh的最小可行阈值附近；所有分支均重新执行容量寻优，并非在主方案容量上事后重算成本。
+
 ## 问题四（3）并离网经济性
 
 并网模式逐场景锁定为与离网储能模式相同的合成氨产量。两种模式年度结果如下。
+
+本地电力自给率按“1－购电量/园区终端用电量”计算；常规负荷供电保障率只反映常规负荷是否失供，两者不再混用。
 
 {frame_to_markdown(annual[annual['运行模式'].isin(['离网配置储能', '并网同产量'])])}
 
@@ -1421,8 +1496,9 @@ def run_full_model(project_root):
                 max_scenario,
                 c_rate=c_rate,
                 daily_self_loss=data["daily_self_loss"],
-                coarse_count=15,
-                refine_count=7,
+                coarse_count=21,
+                refine_count=11,
+                refinement_rounds=5,
             )
             selected = select_capacity_result(frame)
         sensitivity_rows.append(
@@ -1445,8 +1521,9 @@ def run_full_model(project_root):
                 max_scenario,
                 c_rate=MAIN_C_RATE,
                 daily_self_loss=daily_loss,
-                coarse_count=15,
-                refine_count=7,
+                coarse_count=21,
+                refine_count=11,
+                refinement_rounds=5,
             )
             selected = select_capacity_result(frame)
         sensitivity_rows.append(
@@ -1460,7 +1537,20 @@ def run_full_model(project_root):
             }
         )
     for multiplier in (0.8, 1.0, 1.2):
-        selected = select_capacity_result(capacity_search, multiplier)
+        if math.isclose(multiplier, 1.0):
+            frame = capacity_search
+        else:
+            frame, _, _ = search_storage_capacity(
+                data,
+                max_scenario,
+                c_rate=MAIN_C_RATE,
+                daily_self_loss=data["daily_self_loss"],
+                cost_multiplier=multiplier,
+                coarse_count=21,
+                refine_count=11,
+                refinement_rounds=5,
+            )
+        selected = select_capacity_result(frame, multiplier)
         sensitivity_rows.append(
             {
                 "敏感性类型": "储能投资成本",
@@ -1521,6 +1611,7 @@ def run_full_model(project_root):
         "问题四储能容量搜索.csv": capacity_search,
         "问题四储能场景汇总.csv": storage_summary,
         "问题四储能逐时调度.csv": storage_hourly,
+        "问题四储能前后比较.csv": comparison,
         "问题四并离网同产量比较.csv": grid_comparison,
         "问题四年度汇总.csv": annual,
         "问题四灵敏度分析.csv": sensitivity,
@@ -1532,6 +1623,7 @@ def run_full_model(project_root):
         "最大弃电场景": max_curtail_scenario,
         "最优储能容量(MWh)": best_capacity,
         "年度汇总": dataframe_records(annual),
+        "储能前后比较": dataframe_records(comparison),
         "能源自治容量关键点": dataframe_records(frontier[frontier["最小总装机点"] | frontier["最小年供电成本点"]]),
         "灵敏度分析": dataframe_records(sensitivity),
         "最大约束残差": dataframe_records(validation.max(numeric_only=True).to_frame().T),
@@ -1575,7 +1667,38 @@ def run_self_tests():
     assert "| 1.23 | 正常 |" in markdown
     assert math.isclose(hourly_self_loss(0.002), 8.341329886207838e-05, rel_tol=0.0, abs_tol=1e-12)
     assert math.isclose(material_residual(20.0, 20.0, 1.5), 0.0, abs_tol=1e-12)
+    assert math.isclose(
+        hydrogen_capacity_utilization(np.full(24, 20.0), np.full(24, 10.0)),
+        100.0 * (14.0 * 20.0 + 16.0 * 10.0) / 600.0,
+        abs_tol=1e-12,
+    )
+    assert math.isclose(conventional_load_supply_rate(2.0, 50.0), 96.0, abs_tol=1e-12)
+    assert math.isclose(local_electricity_self_sufficiency(20.0, 80.0), 75.0, abs_tol=1e-12)
     assert math.isclose(battery_daily_fixed_cost(1.0), 1000000.0 / (15.0 * 365.0), abs_tol=1e-12)
+
+    def synthetic_capacity_summary(capacity):
+        operating_cost = 100.0 + (capacity - 0.63) ** 2
+        capital_cost = 0.2 * capacity
+        daily_cost = operating_cost + capital_cost
+        return {
+            "储能容量(MWh)": capacity,
+            "常规负荷失供量(MWh)": 0.0,
+            "储能资本分摊(¥/day)": capital_cost,
+            "日净成本(¥/day)": daily_cost,
+            "日氨产量(t/day)": 1.0,
+            "净吨氨成本(¥/t)": daily_cost,
+        }
+
+    synthetic_frame, synthetic_best = adaptive_capacity_grid(
+        synthetic_capacity_summary,
+        upper=100.0,
+        cost_multiplier=0.0,
+        coarse_count=11,
+        refine_count=11,
+        refinement_rounds=5,
+    )
+    assert len(synthetic_frame) > 11
+    assert math.isclose(float(synthetic_best["储能容量(MWh)"]), 0.63, abs_tol=0.002)
 
     balanced = solve_offgrid_hour(
         conventional_load=6.0,
