@@ -1,0 +1,7 @@
+﻿文献编号,类型,作者或机构,题名,与本题相关结论,链接
+L1,政策文件,国家发展改革委、国家能源局,关于有序推动绿电直连发展有关事项的通知（发改能源〔2025〕650号）,要求源荷匹配、交换功率不超过申报容量，鼓励储能和负荷柔性，并落实可观可测可调可控、电能质量和费用责任。,https://www.nea.gov.cn/20250530/2d67a6e49c044f2eacabe1fddf48d20f/c.html
+L2,国内研究,孔令国等,基于功率偏差分摊的源氢氨多元耦合系统参与电网调峰优化调度,源氢氨系统参与调峰后可降低深度调峰量与净负荷方差，支持按实际调峰绩效给予辅助服务补偿。,https://dgjsxb.ces-transaction.com/CN/10.19595/j.cnki.1000-6753.tces.241938
+L3,国内研究,潘禹等,含混合电解槽的绿电-绿氢系统能量管理策略研究,混合电解槽及其能量管理可利用不同设备效率与动态特性提升可再生能源适应能力。,https://www.tynxb.org.cn/CN/10.19912/j.0254-0096.tynxb.2023-1278
+L4,国外研究,Armijo and Philibert,Flexible production of green hydrogen and ammonia from variable solar and wind energy,风光互补和生产柔性有助于降低可再生能源时序波动及其成本。,https://www.sciencedirect.com/science/article/pii/S0360319919342089
+L5,国外研究,Salmon and Bañares-Alcántara,Impact of process flexibility and imperfect forecasting on the operation and design of Haber-Bosch green ammonia,基于LP与MPC说明合成氨过程柔性和预测信息共同影响离网绿氨系统的稳健运行与设计。,https://pubs.rsc.org/doi/d3su00067b
+L6,国外研究,Göke et al.,How flexible electrification can integrate fluctuating renewables,灵活电气化尤其是柔性电解槽可降低剩余峰值负荷、剩余需求和过剩发电。,https://www.sciencedirect.com/science/article/pii/S0360544223012264
