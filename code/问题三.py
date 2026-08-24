@@ -851,6 +851,19 @@ def save_figure(fig, directory, stem):
     plt.close(fig)
 
 
+def _exchange_stair_series(buy, sell):
+    buy = np.asarray(buy, dtype=float)
+    sell = np.asarray(sell, dtype=float)
+    if buy.shape != sell.shape:
+        raise ValueError("Buy and sell series must have the same shape")
+    if np.any(buy < -1e-9) or np.any(sell < -1e-9):
+        raise ValueError("Buy and sell power must be nonnegative")
+    if np.any(buy * sell > 1e-8):
+        raise ValueError("Buy and sell power must be mutually exclusive")
+    edges = np.arange(buy.size + 1, dtype=float)
+    return edges, np.maximum(buy, 0.0), -np.maximum(sell, 0.0)
+
+
 def heatmap(ax, matrix, title, fmt=".1f", cmap=None):
     image = ax.imshow(matrix, aspect="auto", cmap=cmap)
     ax.set_xticks(range(4), [f"光伏{i}" for i in range(1, 5)])
@@ -874,7 +887,11 @@ def generate_figures(summary, hourly, annual, comparison, flexibility, best_outp
     median_cost = float(best_subset["净吨氨成本(¥/t)"].median())
     representative = best_subset.iloc[(best_subset["净吨氨成本(¥/t)"] - median_cost).abs().argmin()]["场景"]
     frame = hourly[(hourly["日氨产量(t/day)"] == best_output) & (hourly["场景"] == representative)].sort_values("时段序号(h)")
-    hours = frame["时段序号(h)"].to_numpy()
+    hours = np.arange(len(frame), dtype=float) + 0.5
+    edges, buy_step, sell_step = _exchange_stair_series(
+        frame["购电功率(MW)"].to_numpy(),
+        frame["售电功率(MW)"].to_numpy(),
+    )
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     axes[0].stackplot(
         hours,
@@ -890,12 +907,31 @@ def generate_figures(summary, hourly, annual, comparison, flexibility, best_outp
     axes[0].set_ylabel("功率 / MW")
     axes[0].legend(ncol=5, loc="upper center", fontsize=9)
     axes[0].grid(axis="y", alpha=0.25)
-    axes[1].fill_between(hours, 0, frame["购电功率(MW)"], color=PALETTE["orange"], alpha=0.85, label="购电功率")
-    axes[1].fill_between(hours, 0, -frame["售电功率(MW)"], color=PALETTE["blue"], alpha=0.85, label="售电功率")
     axes[1].axhline(0, color="#555555", linewidth=0.8)
+    axes[1].stairs(
+        buy_step,
+        edges,
+        baseline=0.0,
+        fill=True,
+        color=PALETTE["orange"],
+        alpha=0.85,
+        linewidth=1.4,
+        label="购电功率",
+    )
+    axes[1].stairs(
+        sell_step,
+        edges,
+        baseline=0.0,
+        fill=True,
+        color=PALETTE["blue"],
+        alpha=0.85,
+        linewidth=1.4,
+        label="售电功率",
+    )
     axes[1].set_ylabel("电网交互 / MW")
-    axes[1].set_xlabel("时段 / h")
-    axes[1].set_xticks(np.arange(1, 25, 2))
+    axes[1].set_xlabel("时刻 / h")
+    axes[1].set_xlim(0.0, float(HOURS))
+    axes[1].set_xticks(np.arange(0, HOURS + 1, 2))
     axes[1].legend(ncol=2, loc="upper left")
     axes[1].grid(axis="y", alpha=0.25)
     save_figure(fig, figure_dir, "问题三代表场景连续调度")
@@ -1154,6 +1190,14 @@ def solve_toy_case():
 
 
 def run_self_tests():
+    edges, buy_step, sell_step = _exchange_stair_series(
+        np.array([5.0, 0.0, 3.0]),
+        np.array([0.0, 4.0, 0.0]),
+    )
+    assert np.array_equal(edges, np.array([0.0, 1.0, 2.0, 3.0]))
+    assert np.array_equal(buy_step, np.array([5.0, 0.0, 3.0]))
+    assert np.array_equal(sell_step, np.array([0.0, -4.0, 0.0]))
+
     metrics = calculate_green_metrics(100.0, 80.0, 30.0, 10.0)
     assert math.isclose(metrics["r1"], 0.75, abs_tol=1e-12)
     assert math.isclose(metrics["r2"], 0.70, abs_tol=1e-12)
