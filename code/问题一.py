@@ -372,14 +372,28 @@ def _write_key_value(path, values, units):
     _write_rows(path, ["指标", "数值", "单位"], rows)
 
 
+def _exchange_stair_series(buy, sell):
+    buy = np.asarray(buy, dtype=float)
+    sell = np.asarray(sell, dtype=float)
+    if buy.shape != sell.shape:
+        raise ValueError("Buy and sell series must have the same shape")
+    if np.any(buy < -1e-9) or np.any(sell < -1e-9):
+        raise ValueError("Buy and sell power must be nonnegative")
+    if np.any(buy * sell > 1e-8):
+        raise ValueError("Buy and sell power must be mutually exclusive")
+    edges = np.arange(buy.size + 1, dtype=float)
+    return edges, np.maximum(buy, 0.0), -np.maximum(sell, 0.0)
+
+
 def _plot_power_balance(hourly, figure_dir):
-    hours = np.arange(1, len(hourly) + 1)
+    hours = np.arange(len(hourly), dtype=float) + 0.5
     wind = np.asarray([row["风电功率"] for row in hourly], dtype=float)
     pv = np.asarray([row["光伏功率"] for row in hourly], dtype=float)
     renewable = np.asarray([row["风光总出力"] for row in hourly], dtype=float)
     load = np.asarray([row["总负荷功率"] for row in hourly], dtype=float)
     buy = np.asarray([row["购电功率"] for row in hourly], dtype=float)
     sell = np.asarray([row["上网功率"] for row in hourly], dtype=float)
+    edges, buy_step, sell_step = _exchange_stair_series(buy, sell)
 
     plt.rcParams["font.sans-serif"] = [
         "Microsoft YaHei",
@@ -413,25 +427,30 @@ def _plot_power_balance(hourly, figure_dir):
     upper.spines[["top", "right"]].set_visible(False)
 
     lower.axhline(0.0, color="#7A7A7A", linewidth=0.8)
-    lower.fill_between(
-        hours,
-        0.0,
-        buy,
+    lower.stairs(
+        buy_step,
+        edges,
+        baseline=0.0,
+        fill=True,
         color=PALETTE["orange"],
         alpha=0.85,
+        linewidth=1.4,
         label="购电功率",
     )
-    lower.fill_between(
-        hours,
-        0.0,
-        -sell,
+    lower.stairs(
+        sell_step,
+        edges,
+        baseline=0.0,
+        fill=True,
         color=PALETTE["blue"],
         alpha=0.85,
+        linewidth=1.4,
         label="上网功率",
     )
-    lower.set_xlabel("时段 / h")
+    lower.set_xlabel("时刻 / h")
     lower.set_ylabel("电网交换功率 / MW")
-    lower.set_xticks(np.arange(1, len(hourly) + 1, 2))
+    lower.set_xlim(0.0, float(len(hourly)))
+    lower.set_xticks(np.arange(0, len(hourly) + 1, 2))
     lower.legend(ncol=2, loc="lower left", frameon=False)
     lower.grid(axis="y", color="#D9DEE8", linewidth=0.7, alpha=0.8)
     lower.spines[["top", "right"]].set_visible(False)

@@ -612,10 +612,27 @@ def plot_typical_schedule(typical_summary, typical_hourly, figure_dir):
     save_figure(figure, figure_dir, "问题二典型场景设备启停热力图")
 
 
+def _exchange_stair_series(buy, sell):
+    buy = np.asarray(buy, dtype=float)
+    sell = np.asarray(sell, dtype=float)
+    if buy.shape != sell.shape:
+        raise ValueError("Buy and sell series must have the same shape")
+    if np.any(buy < -1e-9) or np.any(sell < -1e-9):
+        raise ValueError("Buy and sell power must be nonnegative")
+    if np.any(buy * sell > 1e-8):
+        raise ValueError("Buy and sell power must be mutually exclusive")
+    edges = np.arange(buy.size + 1, dtype=float)
+    return edges, np.maximum(buy, 0.0), -np.maximum(sell, 0.0)
+
+
 def plot_optimal_power_balance(typical_summary, typical_hourly, figure_dir):
     best_output = float(typical_summary.loc[typical_summary["净吨氨成本(¥/t)"].idxmin(), "日氨产量(t/day)"])
     frame = typical_hourly[typical_hourly["日氨产量(t/day)"] == best_output].sort_values("时段序号(h)")
-    hours = frame["时段序号(h)"].to_numpy()
+    hours = np.arange(len(frame), dtype=float) + 0.5
+    edges, buy_step, sell_step = _exchange_stair_series(
+        frame["购电功率(MW)"].to_numpy(),
+        frame["售电功率(MW)"].to_numpy(),
+    )
     figure, axes = plt.subplots(2, 1, figsize=(10.5, 6.8), sharex=True, gridspec_kw={"height_ratios": [2, 1], "hspace": 0.10})
     axes[0].plot(hours, frame["风电功率(MW)"], color=PALETTE["blue"], linewidth=1.8, label="风电功率")
     axes[0].plot(hours, frame["光伏功率(MW)"], color=PALETTE["yellow"], linewidth=1.8, label="光伏功率")
@@ -626,11 +643,12 @@ def plot_optimal_power_balance(typical_summary, typical_hourly, figure_dir):
     axes[0].grid(axis="y", color="#D9DEE8", linewidth=0.7)
     axes[0].spines[["top", "right"]].set_visible(False)
     axes[1].axhline(0, color="#777777", linewidth=0.8)
-    axes[1].fill_between(hours, 0, frame["购电功率(MW)"], color=PALETTE["orange"], alpha=0.85, label="购电功率")
-    axes[1].fill_between(hours, 0, -frame["售电功率(MW)"], color=PALETTE["blue"], alpha=0.85, label="售电功率")
+    axes[1].stairs(buy_step, edges, baseline=0.0, fill=True, color=PALETTE["orange"], alpha=0.85, linewidth=1.4, label="购电功率")
+    axes[1].stairs(sell_step, edges, baseline=0.0, fill=True, color=PALETTE["blue"], alpha=0.85, linewidth=1.4, label="售电功率")
     axes[1].set_ylabel("电网交换功率 / MW")
-    axes[1].set_xlabel("时段 / h")
-    axes[1].set_xticks(np.arange(1, HOURS + 1, 2))
+    axes[1].set_xlabel("时刻 / h")
+    axes[1].set_xlim(0.0, float(HOURS))
+    axes[1].set_xticks(np.arange(0, HOURS + 1, 2))
     axes[1].legend(ncol=2, frameon=False, loc="lower left")
     axes[1].grid(axis="y", color="#D9DEE8", linewidth=0.7)
     axes[1].spines[["top", "right"]].set_visible(False)
@@ -1058,5 +1076,4 @@ if __name__ == "__main__":
         "MILP与排序最大成本差(¥/day)": float(result["checks"]["MILP与排序成本差(¥/day)"].abs().max()),
     }
     print(json.dumps(console, ensure_ascii=False, indent=2))
-
 
